@@ -6,10 +6,13 @@
 
 import json
 import random # 演習用に追加
+import re # 宿題用に追加
 from functools import cache
 from pathlib import Path
+from datetime import datetime # 宿題用に追加
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -103,3 +106,30 @@ def make_quiz(lecture: int) -> str: # 関数を追加
         },
         ensure_ascii=False,
     )
+
+
+def _safe_name(text: str) -> str:
+    # 文字・数字・_・- 以外（/ や . を含む）を - に置き換え、learning_log/ の外を指せないようにする
+    name = re.sub(r"[^\w-]+", "-", text)[:40].strip("-")
+    return name or "log"
+
+
+def save_learning_log(title: str, content: str) -> str:
+    """学習の記録を learning_log/ フォルダに Markdown ファイルとして保存し、保存先を返す。
+
+    利用者が「今日学んだことを記録して」「このまとめを保存して」のように、
+    学習の記録を残すことをはっきり求めたときだけ使う。
+    title には記録の短い題名、content には保存する本文を入れる。
+    """
+    heading = " ".join(title.split()) or "学習記録"  # 改行や連続した空白を1つの空白にまとめる
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"{datetime.now():%Y%m%d-%H%M%S}_{_safe_name(title)}"
+    for n in range(100):
+        path = LOG_DIR / (f"{stem}.md" if n == 0 else f"{stem}-{n}.md")
+        try:
+            with open(path, "x", encoding="utf-8") as f:  # "x" = 同名のファイルがあれば上書きせず失敗する
+                f.write(f"# {heading}\n\n{content}\n")
+        except FileExistsError:
+            continue
+        return f"学習記録を保存しました: learning_log/{path.name}"
+    return "同じ名前の記録が多すぎるため、保存できませんでした。"

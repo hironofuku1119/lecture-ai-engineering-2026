@@ -15,8 +15,7 @@ import argparse
 import inspect
 import json
 from pathlib import Path
-
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolDenied  # 第3回実装用に追加
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -38,12 +37,13 @@ INSTRUCTIONS = """\
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
 agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -98,7 +98,33 @@ def print_tools(target: Agent) -> None:
         print(f"  引数: {json.dumps(params, ensure_ascii=False)}")
 
 
-def print_trace(result) -> None:
+def ask_approvals(requests: DeferredToolRequests) -> tuple[DeferredToolResults, list[str]]:
+    """承認待ちのツール呼び出しを1つずつ利用者に見せ、許可するかを聞く。
+
+    y なら許可、それ以外（Enter だけ・n など）は拒否。入力が途切れた（EOF）・Ctrl+C のときは、
+    何も実行せずにその場で終わる（拒否のあとモデルを呼び続けないため）。
+    返り値は、続きの実行に渡す答えと、許可したツールの名前の一覧。
+    """
+    if requests.calls:
+        # 外で実行するツール（CallDeferred）はこの CLI では扱わない。黙って進めず、はっきり止める
+        raise SystemExit(f"外部で実行するツールには未対応です: {[c.tool_name for c in requests.calls]}")
+    approvals: dict[str, bool | ToolDenied] = {}
+    approved: list[str] = []
+    for call in requests.approvals:
+        print(f"\n[承認待ち] {call.tool_name}({call.args})")
+        try:
+            answer = input("実行してよいですか？ [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\n承認を中断しました。この呼び出しは実行していません。")
+        if answer == "y":
+            approvals[call.tool_call_id] = True
+            approved.append(call.tool_name)
+        else:
+            approvals[call.tool_call_id] = ToolDenied("利用者が実行を断りました。保存せずに続けてください。")
+    return requests.build_results(approvals=approvals), approved  # build_results は ID の照合もする
+
+
+def print_trace(result, runs=None) -> None:
     """どのツールが、どの引数で呼ばれ、何を返したかを表示する。"""
     print("\n--- trace ---")
     for message in result.all_messages():
@@ -107,7 +133,8 @@ def print_trace(result) -> None:
                 print(f"[tool call]   {part.tool_name}({part.args})")
             elif isinstance(part, ToolReturnPart):
                 print(f"[tool return] {part.tool_name} -> {str(part.content)[:120]}…")
-    print(f"[usage] {result.usage}")
+    for i, run in enumerate(runs or [result], start=1):
+        print(f"[usage] 実行{i}: {run.usage}")
 
 
 def main() -> None:
@@ -117,25 +144,42 @@ def main() -> None:
     parser.add_argument("--mcp", action="store_true", help="第5回: ツールを MCP サーバー（app/mcp_servers.json）から受け取る")
     parser.add_argument("--list-tools", action="store_true", help="モデルに見えるツール一覧を表示して終了する（APIキー不要）")
     args = parser.parse_args()
-
     target = build_mcp_agent() if args.mcp else agent
     if args.list_tools:
         print_tools(target)
         return
     if not args.question:
         parser.error("質問を指定してください")
-
     print(f"[model] {MODEL}")
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
+    model = build_model()
+    approved = []  # 承認したツール呼び出し（エラーで止まったときに知らせるため）
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = target.run_sync(args.question, model=model)
+        runs = [result]
+        # 承認待ちで止まったら、利用者に聞いてから、同じ会話の続きとして再実行する
+        while isinstance(result.output, DeferredToolRequests):
+            approvals, newly_approved = ask_approvals(result.output)
+            approved += newly_approved
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=approvals,
+                model=model,
+            )
+            runs.append(result)
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
+        if approved:
+            # 承認したツールは、エラーの前にもう実行されている（保存は済んでいる）ことがある
+            print(
+                f"注意: 承認した {approved} は実行済みの可能性があります。"
+                "learning_log/ を確かめてからやり直してください。"
+            )
         raise SystemExit(1)
     print(result.output)
     if args.trace:
-        print_trace(result)
+        print_trace(result, runs)
 
 
 if __name__ == "__main__":
