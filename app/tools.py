@@ -5,10 +5,14 @@
 """
 
 import json
+import random # 演習用に追加
+import re # 宿題用に追加
 from functools import cache
 from pathlib import Path
+from datetime import datetime # 宿題用に追加
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -77,3 +81,55 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+def make_quiz(lecture: int) -> str: # 関数を追加
+    """指定した回（1始まりの整数）の用語から1つを選び、確認問題と答えを返す。
+
+    「第2回の確認問題を出して」のように、復習用の問題を求められたときに使う。
+    """
+    # 1. load_glossary() から lecture が一致する用語を集める
+    terms = [e for e in load_glossary() if e["lecture"] == lecture]
+
+    # （その回に用語が無いときの処理 → 下の「落とし穴」）
+    if not terms:
+        lectures = sorted({e["lecture"] for e in load_glossary()})
+        return f"第{lecture}回の用語は用語集にありません。用語がある回: {', '.join(map(str, lectures))}"
+
+    # 2. 1つ選ぶ
+    entry = random.choice(terms)
+
+    # 3. 問題と答えを文字列で返す
+    return json.dumps(
+        {
+            "question": f"「{entry['term']}」の意味は？",
+            "answer": entry["definition"],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _safe_name(text: str) -> str:
+    # 文字・数字・_・- 以外（/ や . を含む）を - に置き換え、learning_log/ の外を指せないようにする
+    name = re.sub(r"[^\w-]+", "-", text)[:40].strip("-")
+    return name or "log"
+
+
+def save_learning_log(title: str, content: str) -> str:
+    """学習の記録を learning_log/ フォルダに Markdown ファイルとして保存し、保存先を返す。
+
+    利用者が「今日学んだことを記録して」「このまとめを保存して」のように、
+    学習の記録を残すことをはっきり求めたときだけ使う。
+    title には記録の短い題名、content には保存する本文を入れる。
+    """
+    heading = " ".join(title.split()) or "学習記録"  # 改行や連続した空白を1つの空白にまとめる
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"{datetime.now():%Y%m%d-%H%M%S}_{_safe_name(title)}"
+    for n in range(100):
+        path = LOG_DIR / (f"{stem}.md" if n == 0 else f"{stem}-{n}.md")
+        try:
+            with open(path, "x", encoding="utf-8") as f:  # "x" = 同名のファイルがあれば上書きせず失敗する
+                f.write(f"# {heading}\n\n{content}\n")
+        except FileExistsError:
+            continue
+        return f"学習記録を保存しました: learning_log/{path.name}"
+    return "同じ名前の記録が多すぎるため、保存できませんでした。"
